@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PDF Prompt Injection Research Tool (v4 - clipboard-safe)
+PDF Prompt Injection Research Tool
 =========================================================
 
 For controlled research environments only.
@@ -37,9 +37,8 @@ except ImportError:
     sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
+
 # Constants
-# ---------------------------------------------------------------------------
 
 ZERO_WIDTH_CHARS = ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"]
 
@@ -57,9 +56,7 @@ ALL_VECTORS = [
 ]
 
 
-# ---------------------------------------------------------------------------
 # Small helpers
-# ---------------------------------------------------------------------------
 
 def esc_pdf(s: str) -> str:
     """Escape a string for a PDF literal string."""
@@ -170,9 +167,7 @@ def build_stealth_font(pdf, payload, font_key):
     return font, lit
 
 
-# ---------------------------------------------------------------------------
 # Vector: metadata
-# ---------------------------------------------------------------------------
 def inject_metadata(pdf, payload, page_index=0):
     """
     Payload goes ONLY into /Info /Keywords and XMP pdf:Keywords.
@@ -197,9 +192,7 @@ def inject_metadata(pdf, payload, page_index=0):
     return {"info_dict": "/Keywords only", "xmp": xmp_status}
 
 
-# ---------------------------------------------------------------------------
 # Vector: font /ToUnicode
-# ---------------------------------------------------------------------------
 def inject_font_remap(pdf, payload, page_index=0):
     """
     Draw spaces at a normal coordinate. Payload lives in /ToUnicode only.
@@ -227,9 +220,7 @@ def inject_font_remap(pdf, payload, page_index=0):
     }
 
 
-# ---------------------------------------------------------------------------
 # Vector: accessibility tags
-# ---------------------------------------------------------------------------
 def inject_accessibility(pdf, payload, page_index=0):
     """
     Payload goes ONLY into /Alt and /ActualText of two StructElem nodes.
@@ -281,9 +272,7 @@ def inject_accessibility(pdf, payload, page_index=0):
     }
 
 
-# ---------------------------------------------------------------------------
 # Vector: offscreen (clipboard-safe by construction)
-# ---------------------------------------------------------------------------
 def inject_offscreen(pdf, payload, page_index=0):
     """
     Draw spaces at off-page coordinates with render mode 3. Payload lives
@@ -321,9 +310,7 @@ def inject_offscreen(pdf, payload, page_index=0):
     }
 
 
-# ---------------------------------------------------------------------------
 # Vector: OCG hidden layer (clipboard-safe by construction)
-# ---------------------------------------------------------------------------
 def inject_ocg(pdf, payload, page_index=0):
     """
     OCG named 'Background', OFF by default. Only spaces are drawn inside
@@ -376,9 +363,7 @@ def inject_ocg(pdf, payload, page_index=0):
     }
 
 
-# ---------------------------------------------------------------------------
 # Vector: unicode hiding (clipboard-safe by construction)
-# ---------------------------------------------------------------------------
 def inject_unicode(pdf, payload, page_index=0):
     """
     Zero-width characters are interleaved into the payload, which is then
@@ -412,9 +397,7 @@ def inject_unicode(pdf, payload, page_index=0):
     }
 
 
-# ---------------------------------------------------------------------------
 # Registry
-# ---------------------------------------------------------------------------
 VECTORS = {
     "metadata":      inject_metadata,
     "font":          inject_font_remap,
@@ -425,9 +408,7 @@ VECTORS = {
 }
 
 
-# ---------------------------------------------------------------------------
 # Runner
-# ---------------------------------------------------------------------------
 def run_injection(input_pdf, output_pdf, payload, vectors, page_index=0):
     src = Path(input_pdf)
     if not src.exists():
@@ -457,9 +438,7 @@ def run_injection(input_pdf, output_pdf, payload, vectors, page_index=0):
     return report
 
 
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(
         prog="pdf_inject",
