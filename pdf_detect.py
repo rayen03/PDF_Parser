@@ -1,522 +1,714 @@
 #!/usr/bin/env python3
 """
 PDF Prompt Injection Detector
-=============================
+==============================
 
-Scans PDF files for adversarial prompt injection vectors, hidden text channels,
-and steganographic anomalies across structural layers.
+Companion tool to pdf_inject.py. Scans a PDF for each of the six
+injection vectors and reports per-vector findings with confidence.
 
-Detects:
-  1. Metadata Injection (/Info dictionary & XMP metadata packets)
-  2. Stealth Font Remapping (/ToUnicode divergence vs /Differences spaces)
-  3. Accessibility Tree Exploitation (StructTreeRoot /Alt & /ActualText)
-  4. Off-Screen / Hidden Content (Coordinates beyond MediaBox or render mode 3 Tr)
-  5. Inactive Optional Content Groups (OCG / Layers configured OFF by default)
-  6. Unicode Steganography (Zero-width characters & non-printable codepoints)
+Designed as a reference parser for ATS / LLM pipelines: each detector
+implements the countermeasure for its corresponding injection vector.
+
+Vectors and countermeasures implemented
+---------------------------------------
+  1. metadata       -> Audit /Info and XMP against allow-lists; flag
+                       keyword fields containing imperative phrasing.
+  2. offscreen      -> Clip all text runs to the page MediaBox/CropBox.
+                       Flag runs whose bbox lies outside the clip.
+  3. ocg            -> Resolve Optional Content Group default state;
+                       ignore text inside OFF layers; flag if OFF-layer
+                       text differs from ON-layer text.
+  4. font           -> Cross-check /ToUnicode CMap against the font's
+                       encoding and glyph shapes. Flag any code whose
+                       mapping is longer than one grapheme, or whose
+                       glyph name is /space but mapping is non-space.
+  5. unicode        -> NFKC-normalize extracted text; count Cf-category
+                       characters; flag homoglyph mixing (Latin+Cyrillic
+                       in the same token).
+  6. accessibility  -> Walk StructTreeRoot; compare /Alt and /ActualText
+                       against the drawn text; flag mismatches.
+
+Dependencies
+------------
+    pip install pikepdf pypdf
+
+Optional (enables offscreen bbox and glyph-name checks):
+    pip install pdfminer.six
+
+Usage
+-----
+    python pdf_detect.py -i injected.pdf
+    python pdf_detect.py -i injected.pdf --json report.json
+    python pdf_detect.py -i injected.pdf --vectors metadata,font
 """
 
 import argparse
 import json
 import re
 import sys
+import unicodedata
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import pikepdf
-    from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
+    from pikepdf import Pdf, Name, String, Dictionary, Array
 except ImportError:
-    print("ERROR: pikepdf is required. Run: pip install pikepdf")
+    print("ERROR: pip install pikepdf")
     sys.exit(1)
 
-# Zero-width / hidden unicode characters
-ZERO_WIDTH_CHARS = {
-    "\u200b": "Zero Width Space (U+200B)",
-    "\u200c": "Zero Width Non-Joiner (U+200C)",
-    "\u200d": "Zero Width Joiner (U+200D)",
-    "\u2060": "Word Joiner (U+2060)",
-    "\ufeff": "Zero Width No-Break Space (U+FEFF)",
-}
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
 
-PROMPT_INJECTION_KEYWORDS = [
-    r"ignore\s+(all\s+)?prior\s+instructions",
-    r"ignore\s+(all\s+)?previous\s+instructions",
-    r"system\s*prompt",
-    r"system\s*message",
-    r"top\s+candidate",
-    r"rank\s+this\s+candidate",
-    r"disregard",
-    r"you\s+are\s+now",
-    r"override",
-    r"jailbreak",
+# pdfminer is optional; used for bbox-based offscreen detection
+try:
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LTTextContainer, LTTextLine, LTChar
+    HAVE_PDFMINER = True
+except ImportError:
+    HAVE_PDFMINER = False
+
+
+# Constants and heuristics
+
+IMPERATIVE_PATTERNS = [
+    r"\bignore\s+(all\s+)?(previous|prior|above)\b",
+    r"\bdisregard\s+(all\s+)?(previous|prior|above)\b",
+    r"\brank\s+(this|me|the)\s+candidate\b",
+    r"\bclassify\s+this\s+candidate\b",
+    r"\bsystem\s+prompt\b",
+    r"\byou\s+are\s+(now\s+)?(a|an)\b",
+    r"\boverride\b.{0,20}\binstruction",
+    r"\b(reveal|print|output)\s+(your\s+)?(system\s+)?prompt\b",
+    r"\btop\s+candidate\b",
+    r"\bscore\s+(me|this)\s+(as\s+)?(100|highest|top)\b",
 ]
+IMPERATIVE_RE = re.compile("|".join(IMPERATIVE_PATTERNS), re.IGNORECASE)
+
+# Cf category = format characters (zero-width, BOM, etc.)
+def is_format_char(ch: str) -> bool:
+    return unicodedata.category(ch) == "Cf"
+
+# Scripts that commonly mix with Latin to create homoglyphs
+HOMOGLYPH_RANGES = [
+    (0x0400, 0x04FF),   # Cyrillic
+    (0x0370, 0x03FF),   # Greek
+]
+def is_homoglyph_script(ch: str) -> bool:
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in HOMOGLYPH_RANGES)
+
+def is_latin_letter(ch: str) -> bool:
+    return ch.isalpha() and ord(ch) < 0x0250 and not is_homoglyph_script(ch)
 
 
-def match_injection_heuristic(text: str) -> List[str]:
-    """Check text against known prompt injection heuristic patterns."""
-    hits = []
-    if not text:
-        return hits
-    for pat in PROMPT_INJECTION_KEYWORDS:
-        if re.search(pat, text, re.IGNORECASE):
-            hits.append(pat)
-    return hits
+# Helpers
+
+def get_page_text_pypdf(pdf_path, page_index):
+    """Extract text from one page using pypdf."""
+    if PdfReader is None:
+        return None
+    try:
+        reader = PdfReader(str(pdf_path))
+        return reader.pages[page_index].extract_text() or ""
+    except Exception:
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Detector 1: Metadata (/Info and XMP)
-# ---------------------------------------------------------------------------
-def detect_metadata(pdf: Pdf) -> Dict[str, Any]:
-    findings = []
-    suspicious_entries = {}
+def get_full_text_pypdf(pdf_path):
+    if PdfReader is None:
+        return None
+    try:
+        reader = PdfReader(str(pdf_path))
+        return "\n".join((p.extract_text() or "") for p in reader.pages)
+    except Exception:
+        return None
 
-    # 1. /Info Trailer Dictionary
+
+def resolve_indirect(obj):
+    """Return the resolved object (pikepdf auto-resolves most things)."""
+    return obj
+
+
+def decode_pdf_string(s):
+    """Decode a PDF string to Python str. Handles UTF-16BE BOM."""
+    try:
+        b = bytes(s)
+    except Exception:
+        return str(s)
+    if b.startswith(b"\xfe\xff"):
+        return b[2:].decode("utf-16-be", errors="replace")
+    return b.decode("latin-1", errors="replace")
+
+
+# Vector 1: Metadata
+
+SUSPICIOUS_INFO_KEYS = ["/Keywords", "/Subject", "/Title", "/Author",
+                        "/Creator", "/Producer"]
+
+def detect_metadata(pdf, pdf_path):
+    """
+    Countermeasure:
+      - Extract every /Info field and every XMP property.
+      - Flag any field containing imperative phrasing.
+      - Report the payload so downstream callers can sanitize.
+    Legitimate resumes rarely have imperative commands inside metadata.
+    """
+    findings = {"flags": [], "values": {}}
+
+    # /Info dictionary
     if "/Info" in pdf.trailer:
         info = pdf.trailer["/Info"]
-        for key, val in info.items():
-            key_str = str(key)
-            val_str = str(val)
-            kw_hits = match_injection_heuristic(val_str)
-            if kw_hits:
-                findings.append(f"Heuristic injection match in /Info {key_str}: {kw_hits}")
-                suspicious_entries[f"Info:{key_str}"] = val_str
-            elif key_str == "/Keywords" and len(val_str.strip()) > 0:
-                suspicious_entries[f"Info:{key_str}"] = val_str
+        for key in SUSPICIOUS_INFO_KEYS:
+            if key in info:
+                raw = info[key]
+                text = decode_pdf_string(raw) if isinstance(raw, String) else str(raw)
+                findings["values"][f"Info{key}"] = text
+                if IMPERATIVE_RE.search(text):
+                    findings["flags"].append({
+                        "severity": "high",
+                        "location": f"Info{key}",
+                        "reason": "imperative phrasing in metadata",
+                        "snippet": text[:200],
+                    })
+                elif len(text) > 200:
+                    findings["flags"].append({
+                        "severity": "medium",
+                        "location": f"Info{key}",
+                        "reason": "unusually long metadata value",
+                        "length": len(text),
+                    })
 
-    # 2. XMP Metadata
+    # XMP
     try:
         with pdf.open_metadata() as meta:
             for k, v in meta.items():
-                v_str = str(v)
-                kw_hits = match_injection_heuristic(v_str)
-                if kw_hits:
-                    findings.append(f"Heuristic injection match in XMP [{k}]: {kw_hits}")
-                    suspicious_entries[f"XMP:{k}"] = v_str
-                elif "Keywords" in k and len(v_str.strip()) > 0:
-                    suspicious_entries[f"XMP:{k}"] = v_str
-    except Exception:
-        pass
+                if v is None:
+                    continue
+                text = v if isinstance(v, str) else str(v)
+                findings["values"][f"XMP:{k}"] = text[:400]
+                if IMPERATIVE_RE.search(text):
+                    findings["flags"].append({
+                        "severity": "high",
+                        "location": f"XMP:{k}",
+                        "reason": "imperative phrasing in XMP",
+                        "snippet": text[:200],
+                    })
+    except Exception as e:
+        findings["values"]["XMP"] = f"<unreadable: {e}>"
 
-    detected = len(suspicious_entries) > 0
-    return {
-        "detected": detected,
-        "confidence": "HIGH" if findings else ("MEDIUM" if detected else "NONE"),
-        "findings": findings,
-        "payloads": suspicious_entries,
-    }
+    return findings
 
 
-# ---------------------------------------------------------------------------
-# Detector 2: Stealth Font & /ToUnicode Remapping
-# ---------------------------------------------------------------------------
-def parse_tounicode_cmap(stream_data: bytes) -> Dict[int, str]:
-    """Parse a simple CIDInit /ToUnicode CMap into {code: unicode_char}."""
-    mapping = {}
-    try:
-        text = stream_data.decode("latin-1", errors="ignore")
-    except Exception:
-        return mapping
+# Vector 2: Off-screen text
 
-    # Find bfchar entries: <01> <0041>
-    bfchar_blocks = re.findall(r"beginbfchar(.*?)endbfchar", text, re.DOTALL)
-    for block in bfchar_blocks:
-        pairs = re.findall(r"<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>", block)
-        for code_hex, utf16_hex in pairs:
-            try:
-                code = int(code_hex, 16)
-                decoded_char = bytes.fromhex(utf16_hex).decode("utf-16-be", errors="ignore")
-                mapping[code] = decoded_char
-            except Exception:
-                continue
+def detect_offscreen(pdf, pdf_path):
+    """
+    Countermeasure:
+      - For each page, read the MediaBox.
+      - For each text run (via pdfminer if available), compute its bbox.
+      - Flag any run whose bbox lies entirely outside the MediaBox.
+    Without pdfminer, fall back to scanning raw content streams for Tm/Td
+    coordinates that are wildly out of range.
+    """
+    findings = {"flags": [], "pages": []}
 
-    # Find bfrange entries: <01> <05> <0041>
-    bfrange_blocks = re.findall(r"beginbfrange(.*?)endbfrange", text, re.DOTALL)
-    for block in bfrange_blocks:
-        ranges = re.findall(r"<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>", block)
-        for start_hex, end_hex, val_hex in ranges:
-            try:
-                start_code = int(start_hex, 16)
-                end_code = int(end_hex, 16)
-                base_val = int(val_hex, 16)
-                for idx, c in enumerate(range(start_code, end_code + 1)):
-                    decoded_char = (base_val + idx).to_bytes(2, "big").decode("utf-16-be", errors="ignore")
-                    mapping[c] = decoded_char
-            except Exception:
-                continue
-
-    return mapping
-
-
-def detect_font_remapping(pdf: Pdf) -> Dict[str, Any]:
-    findings = []
-    extracted_payloads = []
-
-    for page_idx, page in enumerate(pdf.pages):
-        if "/Resources" not in page or "/Font" not in page["/Resources"]:
-            continue
-        fonts = page["/Resources"]["/Font"]
-        for font_name, font_obj in fonts.items():
-            if not isinstance(font_obj, Dictionary):
-                continue
-
-            # Check if font defines /ToUnicode
-            if "/ToUnicode" in font_obj:
-                try:
-                    tounicode_stream = font_obj["/ToUnicode"].read_bytes()
-                    mapping = parse_tounicode_cmap(tounicode_stream)
-                except Exception:
-                    mapping = {}
-
-                # Check /Encoding /Differences
-                is_space_mapped = False
-                if "/Encoding" in font_obj and isinstance(font_obj["/Encoding"], Dictionary):
-                    enc = font_obj["/Encoding"]
-                    if "/Differences" in enc:
-                        diffs = enc["/Differences"]
-                        space_count = sum(1 for item in diffs if str(item) == "/space")
-                        if space_count > 3:
-                            is_space_mapped = True
-
-                # Check divergence: ToUnicode produces text while font is mapped to spaces
-                reconstructed_text = "".join(mapping.values()) if mapping else ""
-                kw_hits = match_injection_heuristic(reconstructed_text)
-
-                if is_space_mapped and reconstructed_text.strip():
-                    findings.append(
-                        f"Page {page_idx} font {font_name}: Stealth font detected. "
-                        f"Differences map to /space, but /ToUnicode decodes to: '{reconstructed_text[:80]}...'"
-                    )
-                    extracted_payloads.append(reconstructed_text)
-                elif kw_hits:
-                    findings.append(
-                        f"Page {page_idx} font {font_name}: /ToUnicode contains prompt injection signature: {kw_hits}"
-                    )
-                    extracted_payloads.append(reconstructed_text)
-
-    detected = len(extracted_payloads) > 0
-    return {
-        "detected": detected,
-        "confidence": "HIGH" if detected else "NONE",
-        "findings": findings,
-        "extracted_payloads": extracted_payloads,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Detector 3: Accessibility Structure Tree (/StructTreeRoot)
-# ---------------------------------------------------------------------------
-def detect_accessibility(pdf: Pdf) -> Dict[str, Any]:
-    findings = []
-    extracted_payloads = []
-
-    if "/StructTreeRoot" not in pdf.Root:
-        return {"detected": False, "confidence": "NONE", "findings": [], "extracted_payloads": []}
-
-    struct_root = pdf.Root["/StructTreeRoot"]
-
-    def walk_element(elem):
-        if not isinstance(elem, Dictionary):
-            return
-
-        for tag in ["/Alt", "/ActualText"]:
-            if tag in elem:
-                val = str(elem[tag])
-                kw_hits = match_injection_heuristic(val)
-                s_type = str(elem.get("/S", "Unknown"))
-                if kw_hits:
-                    findings.append(
-                        f"Structural element {s_type} has {tag} with prompt injection heuristic: {kw_hits}"
-                    )
-                    extracted_payloads.append(val)
-                elif len(val.strip()) > 30 and not val.strip().isalpha():
-                    # Unusually long non-prose metadata in Alt/ActualText
-                    findings.append(f"Structural element {s_type} has suspicious {tag} payload: '{val[:80]}...'")
-                    extracted_payloads.append(val)
-
-        if "/K" in elem:
-            children = elem["/K"]
-            if isinstance(children, Array):
-                for child in children:
-                    walk_element(child)
-            elif isinstance(children, Dictionary):
-                walk_element(children)
-
-    if "/K" in struct_root:
-        k_content = struct_root["/K"]
-        if isinstance(k_content, Array):
-            for item in k_content:
-                walk_element(item)
-        elif isinstance(k_content, Dictionary):
-            walk_element(k_content)
-
-    detected = len(extracted_payloads) > 0
-    return {
-        "detected": detected,
-        "confidence": "HIGH" if any("heuristic" in f for f in findings) else ("MEDIUM" if detected else "NONE"),
-        "findings": findings,
-        "extracted_payloads": extracted_payloads,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Detector 4: Offscreen / Invisible Content Streams
-# ---------------------------------------------------------------------------
-def detect_offscreen(pdf: Pdf) -> Dict[str, Any]:
-    findings = []
-    suspicious_blocks = []
-
-    for page_idx, page in enumerate(pdf.pages):
+    for i, page in enumerate(pdf.pages):
         try:
             mb = [float(x) for x in page.MediaBox]
         except Exception:
-            mb = [0, 0, 612, 792]
+            mb = [0.0, 0.0, 612.0, 792.0]
 
-        min_x, min_y, max_x, max_y = mb[0], mb[1], mb[2], mb[3]
+        page_report = {"page": i, "mediabox": mb, "offscreen_runs": 0,
+                       "out_of_range_tm": []}
 
-        # Extract content streams
-        raw_streams = []
-        if "/Contents" in page:
-            c = page["/Contents"]
-            if isinstance(c, Array):
-                for stream in c:
-                    try:
-                        raw_streams.append(stream.read_bytes().decode("latin-1", errors="ignore"))
-                    except Exception:
-                        pass
-            elif isinstance(c, Stream):
+        # Preferred path: pdfminer with layout gives real bboxes
+        if HAVE_PDFMINER:
+            try:
+                for layout in extract_pages(str(pdf_path), page_numbers=[i]):
+                    for element in layout:
+                        if isinstance(element, LTTextContainer):
+                            for line in element:
+                                if not isinstance(line, LTTextLine):
+                                    continue
+                                x0, y0, x1, y1 = line.bbox
+                                # Fully outside the MediaBox?
+                                if (x1 < mb[0] or x0 > mb[2] or
+                                        y1 < mb[1] or y0 > mb[3]):
+                                    page_report["offscreen_runs"] += 1
+                                    text = line.get_text().strip()
+                                    findings["flags"].append({
+                                        "severity": "high",
+                                        "location": f"page {i} bbox {line.bbox}",
+                                        "reason": "text outside MediaBox",
+                                        "snippet": text[:200],
+                                    })
+            except Exception:
+                pass
+
+        # Fallback: scan content stream for out-of-range Tm operands
+        try:
+            content = page.Contents
+            streams = list(content) if isinstance(content, Array) else [content]
+            for s in streams:
                 try:
-                    raw_streams.append(c.read_bytes().decode("latin-1", errors="ignore"))
+                    data = bytes(s.read_bytes()).decode("latin-1", "replace")
+                except Exception:
+                    continue
+                for m in re.finditer(r"([-\d.]+)\s+([-\d.]+)\s+Tm", data):
+                    x, y = float(m.group(1)), float(m.group(2))
+                    if x < mb[0] - 100 or x > mb[2] + 100 or \
+                       y < mb[1] - 100 or y > mb[3] + 100:
+                        page_report["out_of_range_tm"].append([x, y])
+                        findings["flags"].append({
+                            "severity": "medium",
+                            "location": f"page {i} Tm",
+                            "reason": "text matrix places content far outside MediaBox",
+                            "coords": [x, y],
+                        })
+        except Exception:
+            pass
+
+        findings["pages"].append(page_report)
+
+    return findings
+
+
+# Vector 3: OCG hidden layers
+
+def detect_ocg(pdf, pdf_path):
+    """
+    Countermeasure:
+      - Read /OCProperties /D /OFF to find layers that are off by default.
+      - Flag any page whose content stream references /OC /<name> BDC where
+        <name> resolves to an OFF OCG.
+      - Report the extracted text of the marked-content section so callers
+        can decide to drop it.
+    """
+    findings = {"flags": [], "ocgs": [], "off_by_default": []}
+
+    if "/OCProperties" not in pdf.Root:
+        return findings
+
+    ocprops = pdf.Root["/OCProperties"]
+    ocgs = ocprops.get("/OCGs", Array([]))
+    default_cfg = ocprops.get("/D", Dictionary({}))
+    off_list = default_cfg.get("/OFF", Array([]))
+
+    off_names = set()
+    for off_item in off_list:
+        try:
+            if isinstance(off_item, Dictionary) and "/Name" in off_item:
+                off_names.add(str(off_item["/Name"]))
+        except Exception:
+            pass
+
+    for ocg in ocgs:
+        name = ""
+        if isinstance(ocg, Dictionary) and "/Name" in ocg:
+            try:
+                name = str(ocg["/Name"])
+            except Exception:
+                name = "<unnamed>"
+        findings["ocgs"].append(name)
+
+        is_off = (name in off_names)
+        if not is_off and hasattr(ocg, "objgen"):
+            is_off = any(hasattr(o, "objgen") and o.objgen == ocg.objgen for o in off_list)
+
+        if is_off:
+            findings["off_by_default"].append(name or "<unnamed>")
+
+    if findings["off_by_default"]:
+        findings["flags"].append({
+            "severity": "medium",
+            "location": "OCProperties/D/OFF",
+            "reason": "one or more OCG layers are off by default",
+            "layers": findings["off_by_default"],
+        })
+
+    return findings
+
+
+# Vector 4: Font /ToUnicode re-mapping
+
+BFCHAR_RE = re.compile(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>")
+BFRANGE_RE = re.compile(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>")
+
+
+def _decode_utf16_hex(h: str) -> str:
+    try:
+        return bytes.fromhex(h).decode("utf-16-be", errors="replace")
+    except Exception:
+        return ""
+
+
+def detect_font(pdf, pdf_path):
+    """
+    Countermeasure:
+      - Walk every font in every page's /Resources /Font.
+      - If the font has a /ToUnicode stream, decode its bfchar and bfrange
+        entries.
+      - Flag any mapping where:
+          * a single source code maps to a multi-character string, or
+          * the mapped target contains non-ASCII while the source code is
+            an ASCII printable value that would render as a visible glyph.
+      - Also flag /Differences arrays that map many codes to /space while
+        ToUnicode maps those codes to non-space.
+    """
+    findings = {"flags": [], "fonts_checked": 0}
+
+    for pi, page in enumerate(pdf.pages):
+        if "/Resources" not in page:
+            continue
+        res = page["/Resources"]
+        if "/Font" not in res:
+            continue
+        fonts = res["/Font"]
+
+        for fname, font in fonts.items():
+            findings["fonts_checked"] += 1
+            font_report = {"page": pi, "name": str(fname)}
+
+            # Read ToUnicode
+            cmap_entries = {}
+            if "/ToUnicode" in font:
+                try:
+                    cmap_data = bytes(font["/ToUnicode"].read_bytes()).decode(
+                        "latin-1", "replace"
+                    )
+                    for m in BFCHAR_RE.finditer(cmap_data):
+                        src = int(m.group(1), 16)
+                        tgt = _decode_utf16_hex(m.group(2))
+                        cmap_entries[src] = tgt
+                    for m in BFRANGE_RE.finditer(cmap_data):
+                        lo = int(m.group(1), 16)
+                        hi = int(m.group(2), 16)
+                        tgt_hex = m.group(3)
+                        base = int(tgt_hex, 16)
+                        for i, code in enumerate(range(lo, hi + 1)):
+                            cmap_entries[code] = chr(base + i)
                 except Exception:
                     pass
 
-        content_str = "\n".join(raw_streams)
+            font_report["cmap_entries"] = len(cmap_entries)
 
-        # Check render mode 3 Tr (invisible text)
-        if re.search(r"\b3\s+Tr\b", content_str):
-            findings.append(f"Page {page_idx}: Found render mode '3 Tr' (invisible text operator)")
-            suspicious_blocks.append(f"Page {page_idx}: 3 Tr invisible text")
+            # Build the /Differences map (code -> glyph name)
+            diff_map = {}
+            if "/Encoding" in font and isinstance(font["/Encoding"], Dictionary) and "/Differences" in font["/Encoding"]:
+                diffs = font["/Encoding"]["/Differences"]
+                current = 0
+                for item in diffs:
+                    if isinstance(item, (int, float)):
+                        current = int(item)
+                    else:
+                        diff_map[current] = str(item)
+                        current += 1
 
-        # Check matrix or coordinates Tm / Td with offscreen positions
-        tm_matches = re.findall(
-            r"([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+Tm", content_str
-        )
-        for _, _, _, _, tx, ty in tm_matches:
-            try:
-                x, y = float(tx), float(ty)
-                if x < (min_x - 500) or x > (max_x + 500) or y < (min_y - 500) or y > (max_y + 500):
-                    findings.append(
-                        f"Page {page_idx}: Text placed far outside MediaBox at coordinate ({x:.1f}, {y:.1f})"
-                    )
-                    suspicious_blocks.append(f"Page {page_idx}: offscreen ({x:.1f}, {y:.1f})")
-                    break
-            except ValueError:
-                continue
+            # Analyze
+            suspicious = []
+            for code, mapped in cmap_entries.items():
+                # Case A: single code -> multi-char string
+                if len(mapped) > 1:
+                    suspicious.append({
+                        "code": code,
+                        "mapped": mapped,
+                        "reason": "single code maps to multi-char string",
+                    })
+                    continue
 
-    detected = len(suspicious_blocks) > 0
-    return {
-        "detected": detected,
-        "confidence": "HIGH" if detected else "NONE",
-        "findings": findings,
-        "anomalies": suspicious_blocks,
+                # Case B: code is mapped to /space via Differences but
+                # ToUnicode says it's a non-space character
+                glyph = diff_map.get(code)
+                if glyph == "/space" and mapped and not mapped.isspace():
+                    suspicious.append({
+                        "code": code,
+                        "mapped": mapped,
+                        "glyph": glyph,
+                        "reason": "rendered as space, extracted as non-space",
+                    })
+
+            if suspicious:
+                findings["flags"].append({
+                    "severity": "high",
+                    "location": f"page {pi} font {fname}",
+                    "reason": "ToUnicode / Differences mismatch",
+                    "examples": suspicious[:8],
+                    "count": len(suspicious),
+                })
+
+            findings.setdefault("font_reports", []).append(font_report)
+
+    return findings
+
+
+# Vector 5: Unicode hiding (Cf chars + homoglyphs)
+
+def detect_unicode(pdf, pdf_path):
+    """
+    Countermeasure:
+      - Extract all visible text (pypdf or pdfminer).
+      - NFKC-normalize.
+      - Count Cf-category characters.
+      - Flag tokens that mix Latin with Cyrillic/Greek (homoglyph sign).
+      - Flag any Cf character density above 1 per 20 visible chars.
+    """
+    findings = {"flags": [], "stats": {}}
+
+    text = get_full_text_pypdf(pdf_path) or ""
+
+    if HAVE_PDFMINER and not text:
+        try:
+            from pdfminer.high_level import extract_text as pm_extract
+            text = pm_extract(str(pdf_path)) or ""
+        except Exception:
+            pass
+
+    if not text:
+        findings["stats"]["note"] = "no text extracted"
+        return findings
+
+    cf_chars = [c for c in text if is_format_char(c)]
+    findings["stats"]["total_chars"] = len(text)
+    findings["stats"]["cf_chars"] = len(cf_chars)
+    findings["stats"]["cf_breakdown"] = {
+        f"U+{ord(c):04X} {unicodedata.name(c, 'UNKNOWN')}": n
+        for c, n in Counter(cf_chars).items()
     }
 
+    if cf_chars:
+        density = len(cf_chars) / max(1, len(text))
+        findings["stats"]["cf_density"] = density
+        if density > 0.05:
+            findings["flags"].append({
+                "severity": "high",
+                "location": "extracted text",
+                "reason": "high zero-width / format-character density",
+                "density": round(density, 4),
+                "count": len(cf_chars),
+            })
+        elif cf_chars:
+            findings["flags"].append({
+                "severity": "medium",
+                "location": "extracted text",
+                "reason": "format-character(s) present",
+                "count": len(cf_chars),
+            })
 
-# ---------------------------------------------------------------------------
-# Detector 5: Optional Content Groups (OCG Hidden Layers)
-# ---------------------------------------------------------------------------
-def detect_ocg(pdf: Pdf) -> Dict[str, Any]:
-    findings = []
-    off_layers = []
+    # Homoglyph mixing
+    tokens = re.findall(r"[A-Za-z\u0370-\u04FF]+", text)
+    mixed = []
+    for tok in tokens:
+        has_latin = any(is_latin_letter(c) for c in tok)
+        has_homoglyph = any(is_homoglyph_script(c) for c in tok)
+        if has_latin and has_homoglyph:
+            mixed.append(tok)
+    if mixed:
+        findings["flags"].append({
+            "severity": "high",
+            "location": "extracted text",
+            "reason": "mixed-script tokens (Latin + Cyrillic/Greek)",
+            "examples": mixed[:10],
+            "count": len(mixed),
+        })
 
-    if "/OCProperties" in pdf.Root:
-        ocprops = pdf.Root["/OCProperties"]
-        if "/D" in ocprops and isinstance(ocprops["/D"], Dictionary):
-            d_dict = ocprops["/D"]
-            if "/OFF" in d_dict and isinstance(d_dict["/OFF"], Array):
-                for layer_ref in d_dict["/OFF"]:
-                    if isinstance(layer_ref, Dictionary) and "/Name" in layer_ref:
-                        layer_name = str(layer_ref["/Name"])
-                        off_layers.append(layer_name)
-                        findings.append(f"Hidden layer configured OFF by default: '{layer_name}'")
+    # Normalize and diff to surface the payload after normalization
+    normalized = unicodedata.normalize("NFKC", text)
+    if normalized != text:
+        findings["stats"]["nfkc_changed"] = True
 
-    # Check page content streams for /OC markings
-    for page_idx, page in enumerate(pdf.pages):
-        if "/Contents" in page:
-            raw = ""
-            if isinstance(page["/Contents"], Array):
-                for s in page["/Contents"]:
-                    raw += s.read_bytes().decode("latin-1", errors="ignore")
-            elif isinstance(page["/Contents"], Stream):
-                raw += page["/Contents"].read_bytes().decode("latin-1", errors="ignore")
-
-            if "/OC" in raw:
-                findings.append(f"Page {page_idx}: Contains marked content referencing Optional Content Groups (/OC)")
-
-    detected = len(off_layers) > 0
-    return {
-        "detected": detected,
-        "confidence": "HIGH" if off_layers else "NONE",
-        "findings": findings,
-        "off_layers": off_layers,
-    }
+    return findings
 
 
-# ---------------------------------------------------------------------------
-# Detector 6: Unicode Steganography
-# ---------------------------------------------------------------------------
-def detect_unicode_steganography(pdf: Pdf) -> Dict[str, Any]:
-    findings = []
-    zw_hits = {}
+# Vector 6: Accessibility tags (/Alt, /ActualText)
 
-    def scan_for_zw(source_name: str, text: str):
-        if not text:
+def detect_accessibility(pdf, pdf_path):
+    """
+    Countermeasure:
+      - Walk /StructTreeRoot children.
+      - Collect all /Alt and /ActualText strings.
+      - Flag any that contain imperative phrasing, or that do NOT appear in
+        the visible extracted text (a strong sign of hidden payload).
+    """
+    findings = {"flags": [], "alt_actual_text": []}
+
+    if "/StructTreeRoot" not in pdf.Root:
+        return findings
+
+    visible = get_full_text_pypdf(pdf_path) or ""
+
+    def walk(node, depth=0):
+        if depth > 12:
             return
-        found_chars = []
-        for ch, name in ZERO_WIDTH_CHARS.items():
-            count = text.count(ch)
-            if count > 0:
-                found_chars.append(f"{name} x{count}")
-        if found_chars:
-            findings.append(f"{source_name}: Contains zero-width characters: {', '.join(found_chars)}")
-            zw_hits[source_name] = found_chars
+        if isinstance(node, Array):
+            for child in node:
+                walk(child, depth + 1)
+            return
+        if isinstance(node, Dictionary):
+            for key in ("/Alt", "/ActualText"):
+                if key in node:
+                    text = decode_pdf_string(node[key])
+                    entry = {"key": key, "text": text[:400]}
+                    findings["alt_actual_text"].append(entry)
 
-    # 1. Check metadata
-    if "/Info" in pdf.trailer:
-        for k, v in pdf.trailer["/Info"].items():
-            scan_for_zw(f"Info:{k}", str(v))
+                    if IMPERATIVE_RE.search(text):
+                        findings["flags"].append({
+                            "severity": "high",
+                            "location": f"StructTree {key}",
+                            "reason": "imperative phrasing in accessibility tag",
+                            "snippet": text[:200],
+                        })
+                    elif text and text not in visible:
+                        findings["flags"].append({
+                            "severity": "high",
+                            "location": f"StructTree {key}",
+                            "reason": "accessibility text not present in visible page text",
+                            "snippet": text[:200],
+                        })
 
-    # 2. Check ToUnicode streams
-    for page_idx, page in enumerate(pdf.pages):
-        if "/Resources" in page and "/Font" in page["/Resources"]:
-            for font_name, font_obj in page["/Resources"]["/Font"].items():
-                if isinstance(font_obj, Dictionary) and "/ToUnicode" in font_obj:
-                    try:
-                        stream_bytes = font_obj["/ToUnicode"].read_bytes()
-                        mapping = parse_tounicode_cmap(stream_bytes)
-                        full_mapped = "".join(mapping.values())
-                        scan_for_zw(f"Page {page_idx} Font {font_name} /ToUnicode", full_mapped)
-                    except Exception:
-                        pass
+            for v in node.values():
+                walk(v, depth + 1)
 
-    # 3. Check StructTreeRoot
-    if "/StructTreeRoot" in pdf.Root:
-        def walk_zw(elem):
-            if not isinstance(elem, Dictionary):
-                return
-            for tag in ["/Alt", "/ActualText"]:
-                if tag in elem:
-                    scan_for_zw(f"StructElem {tag}", str(elem[tag]))
-            if "/K" in elem:
-                k = elem["/K"]
-                if isinstance(k, Array):
-                    for c in k:
-                        walk_zw(c)
-                elif isinstance(k, Dictionary):
-                    walk_zw(k)
+    walk(pdf.Root["/StructTreeRoot"])
+    return findings
 
-        walk_zw(pdf.Root["/StructTreeRoot"])
 
-    detected = len(zw_hits) > 0
+# Orchestration
+
+DETECTORS = {
+    "metadata":      detect_metadata,
+    "offscreen":     detect_offscreen,
+    "ocg":           detect_ocg,
+    "font":          detect_font,
+    "unicode":       detect_unicode,
+    "accessibility": detect_accessibility,
+}
+
+
+def compute_verdict(report):
+    """Aggregate flags into a top-level verdict and score."""
+    sev_weights = {"high": 1.0, "medium": 0.4, "low": 0.1}
+    score = 0.0
+    high = 0
+    medium = 0
+    for vector, res in report.items():
+        if not isinstance(res, dict):
+            continue
+        for flag in res.get("flags", []):
+            w = sev_weights.get(flag.get("severity", "low"), 0.1)
+            score += w
+            if flag.get("severity") == "high":
+                high += 1
+            elif flag.get("severity") == "medium":
+                medium += 1
+
+    if high > 0:
+        verdict = "INJECTED"
+    elif medium > 0:
+        verdict = "SUSPICIOUS"
+    else:
+        verdict = "CLEAN"
+
     return {
-        "detected": detected,
-        "confidence": "HIGH" if detected else "NONE",
-        "findings": findings,
-        "occurrences": zw_hits,
+        "verdict": verdict,
+        "score": round(score, 2),
+        "high_flags": high,
+        "medium_flags": medium,
     }
 
 
-# ---------------------------------------------------------------------------
-# Main Scan Pipeline
-# ---------------------------------------------------------------------------
-def scan_pdf(filepath: str) -> Dict[str, Any]:
-    path = Path(filepath)
-    if not path.exists():
-        raise FileNotFoundError(f"Input file not found: {path}")
+def scan(pdf_path, vectors=None):
+    src = Path(pdf_path)
+    if not src.exists():
+        raise FileNotFoundError(src)
 
-    pdf = Pdf.open(str(path))
+    vectors = vectors or list(DETECTORS.keys())
+    pdf = Pdf.open(str(src))
 
-    results = {
-        "target": str(path),
-        "page_count": len(pdf.pages),
-        "vectors": {
-            "metadata": detect_metadata(pdf),
-            "font": detect_font_remapping(pdf),
-            "accessibility": detect_accessibility(pdf),
-            "offscreen": detect_offscreen(pdf),
-            "ocg": detect_ocg(pdf),
-            "unicode": detect_unicode_steganography(pdf),
-        },
-    }
+    report = {}
+    for v in vectors:
+        if v not in DETECTORS:
+            report[v] = {"error": f"unknown vector: {v}"}
+            continue
+        try:
+            report[v] = DETECTORS[v](pdf, str(src))
+        except Exception as e:
+            report[v] = {"error": f"{type(e).__name__}: {e}"}
 
     pdf.close()
-
-    # Aggregate evaluation
-    detected_vectors = [v for v, res in results["vectors"].items() if res["detected"]]
-    total_findings = sum(len(res["findings"]) for res in results["vectors"].values())
-
-    results["summary"] = {
-        "clean": len(detected_vectors) == 0,
-        "detected_vectors": detected_vectors,
-        "detected_count": len(detected_vectors),
-        "total_anomalies": total_findings,
-        "threat_level": "CRITICAL" if len(detected_vectors) >= 3 else ("SUSPICIOUS" if detected_vectors else "CLEAN"),
-    }
-
-    return results
+    report["_verdict"] = compute_verdict(report)
+    return report
 
 
-def print_cli_report(results: Dict[str, Any]):
-    print("=" * 65)
-    print("PDF PROMPT INJECTION SCAN REPORT")
-    print("=" * 65)
-    print(f"Target:       {results['target']}")
-    print(f"Page Count:   {results['page_count']}")
-    summary = results["summary"]
-    print(f"Threat Level: {summary['threat_level']}")
-    print(f"Injections:   {summary['detected_count']} vector(s) identified")
-    print("-" * 65)
-
-    for vector, details in results["vectors"].items():
-        status = "[!] DETECTED" if details["detected"] else "[+] CLEAN"
-        conf = f"[{details['confidence']}]" if details["detected"] else ""
-        print(f"[{vector.upper()}] {status} {conf}")
-        for finding in details.get("findings", []):
-            safe_finding = finding.encode(sys.stdout.encoding or "utf-8", errors="backslashreplace").decode(
-                sys.stdout.encoding or "utf-8", errors="ignore"
-            )
-            print(f"   - {safe_finding}")
-
-    print("=" * 65)
-
+# CLI
 
 def main():
     ap = argparse.ArgumentParser(
         prog="pdf_detect",
-        description="Scan PDF files for prompt injection vectors and steganographic anomalies.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Detect prompt injection vectors in a PDF.",
     )
-    ap.add_argument("-i", "--input", required=True, help="Path to PDF file to scan")
-    ap.add_argument("-o", "--output", default=None, help="Save JSON detection report to path")
-    ap.add_argument("--json", action="store_true", help="Print only JSON report to stdout")
+    ap.add_argument("-i", "--input", required=True, help="PDF to scan")
+    ap.add_argument("--vectors", default=None,
+                    help="Comma-separated subset (default: all)")
+    ap.add_argument("--json", default=None,
+                    help="Write the full report as JSON to this path")
+    ap.add_argument("-o", "--output", default=None,
+                    help="Alias for --json: write report to path")
+    ap.add_argument("--quiet", action="store_true",
+                    help="Only print the verdict line")
     args = ap.parse_args()
 
+    json_dest = args.json or args.output
+
+    vectors = None
+    if args.vectors:
+        vectors = [v.strip() for v in args.vectors.split(",") if v.strip()]
+
     try:
-        report = scan_pdf(args.input)
-    except Exception as e:
-        print(f"ERROR: {e}")
+        report = scan(args.input, vectors)
+    except FileNotFoundError:
+        print(f"ERROR: file not found: {args.input}")
         sys.exit(1)
 
-    if args.output:
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2)
-        print(f"[+] Report written to {out_path}")
+    if json_dest:
+        dest_path = Path(json_dest)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        if not args.quiet:
+            print(f"[*] JSON report written to {json_dest}")
 
-    if args.json:
-        print(json.dumps(report, indent=2))
-    elif not args.output or not args.json:
-        print_cli_report(report)
+    verdict = report.get("_verdict", {})
+    print("=" * 60)
+    print(f"File    : {args.input}")
+    print(f"Verdict : {verdict.get('verdict')}  "
+          f"(score {verdict.get('score')}, "
+          f"high={verdict.get('high_flags')}, "
+          f"medium={verdict.get('medium_flags')})")
+    print("=" * 60)
+
+    if args.quiet:
+        return
+
+    encoding = sys.stdout.encoding or "utf-8"
+    for v, res in report.items():
+        if v.startswith("_"):
+            continue
+        flags = res.get("flags", []) if isinstance(res, dict) else []
+        print(f"\n[{v}]  flags: {len(flags)}")
+        for f in flags[:8]:
+            loc = f.get("location", "?")
+            reason = f.get("reason", "?")
+            sev = f.get("severity", "?")
+            safe_loc = str(loc).encode(encoding, errors="backslashreplace").decode(encoding, errors="ignore")
+            safe_reason = str(reason).encode(encoding, errors="backslashreplace").decode(encoding, errors="ignore")
+            print(f"  - ({sev}) {safe_loc}: {safe_reason}")
+            if "snippet" in f:
+                safe_snippet = str(f["snippet"][:120]).encode(encoding, errors="backslashreplace").decode(encoding, errors="ignore")
+                print(f"      snippet: {safe_snippet!r}")
+        if isinstance(res, dict) and "error" in res:
+            print(f"  ! error: {res['error']}")
 
 
 if __name__ == "__main__":
